@@ -1,0 +1,164 @@
+# Agent A 自定义插件 · OpenAPI 3.0 描述
+# 用途：百炼智能体应用「插件」中导入本文件，模型收集齐信息后调用该接口，
+#       后端拿到的 requestBody 就是结构化偏好 JSON —— 比让模型"最后输出一段 JSON"可靠得多。
+#
+# 部署：把 servers.url 换成你后端的公网地址（本地调试可用 ngrok/cpolar 内网穿透）。
+#      百炼调用你的后端，所以必须是公网可达的 HTTPS。
+#
+# 鉴权：Header X-Agent-Key，值与后端环境变量 NINGANJU_AGENT_KEY 一致。
+#      不要用裸接口，否则任何人都能往你的库里写数据。
+
+openapi: 3.0.1
+info:
+  title: 宁安居租房偏好提交
+  description: 接收对话采集到的结构化租房偏好，落库并返回 preference_id
+  version: "1.0"
+
+servers:
+  - url: https://your-backend.example.com
+
+paths:
+  /api/agent/submit-preference:
+    post:
+      operationId: submit_preference
+      summary: 提交用户的结构化租房偏好
+      description: >
+        当且仅当以下四项必填信息全部收集完毕、且用户已对复述内容确认无误时调用：
+        工作地址（可定位到具体实体）、月租预算区间、可接受单程通勤时长、主要通勤方式。
+        调用成功后返回 preference_id，用于驱动后续的地段评估工作流。
+        信息不全时不要调用本接口，继续追问。
+      security:
+        - AgentKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Preference'
+      responses:
+        '200':
+          description: 提交成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  preference_id: { type: string, description: 后续评估工作流的入参 }
+                  message: { type: string }
+        '400':
+          description: 字段校验失败，应向用户追问缺失项
+
+components:
+  securitySchemes:
+    AgentKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Agent-Key
+
+  schemas:
+    Preference:
+      type: object
+      required: [schema_version, work, budget, commute]
+      properties:
+        schema_version:
+          type: string
+          default: "1.0"
+
+        work:
+          type: object
+          required: [address_raw, address_query]
+          properties:
+            address_raw:
+              type: string
+              description: 用户原话，保留不动
+            address_query:
+              type: string
+              description: >
+                用于地理编码的地址，必须包含可定位的实体名（写字楼、园区、大学校区、地铁站）。
+                "江宁区"、"城南"这类只有区域名的值不合格，必须追问到具体地点。
+            district:
+              type: string
+              nullable: true
+
+        budget:
+          type: object
+          required: [min, max]
+          properties:
+            min: { type: integer, description: 月租下限（元） }
+            max: { type: integer, description: 月租上限（元） }
+            include_utilities: { type: boolean, default: false, description: 预算是否已包含水电物业 }
+
+        commute:
+          type: object
+          required: [max_minutes]
+          properties:
+            max_minutes:
+              type: integer
+              description: 单程可接受通勤时长（分钟）。必须是时长，不是公里数。
+            preferred_modes:
+              type: array
+              items: { type: string, enum: [transit, driving, riding, walking] }
+              description: transit=地铁公交，driving=自驾，riding=电动车骑行，walking=步行
+            metro_walk_max_meters:
+              type: integer
+              nullable: true
+              description: 可接受的到地铁站步行距离（米），用户不在意则不填
+            transfer_tolerance:
+              type: integer
+              nullable: true
+              description: 可接受换乘次数，用户不在意则不填
+
+        housing:
+          type: object
+          properties:
+            rent_type: { type: string, enum: [整租, 合租, 不限] }
+            layout:
+              type: array
+              items: { type: string, enum: [开间, 一室一厅, 两室一厅, 三室及以上, 合租主卧, 合租次卧] }
+            area_min_sqm: { type: number, nullable: true }
+            must_have:
+              type: array
+              items: { type: string, enum: [独立卫生间, 独立厨房, 电梯, 空调, 洗衣机, 家电齐全, 可养宠物, 南向采光, 可短租, 有阳台] }
+            deal_breakers:
+              type: array
+              items: { type: string, enum: [群租, 地下室, 无电梯高层, 隔断房, 临街嘈杂, 老破小, 无独卫] }
+            move_in_date: { type: string, format: date, nullable: true }
+
+        profile:
+          type: object
+          properties:
+            identity: { type: string, enum: [应届毕业生, 职场新人, 工作多年, 情侣同住, 有娃家庭, 在读学生], nullable: true }
+            work_schedule: { type: string, enum: [朝九晚五, 弹性工时, 加班较多, 倒班, 远程为主], nullable: true }
+            lifestyle_tags:
+              type: array
+              description: >
+                只能使用枚举中的标签，不要自创。系统会按固定规则把这些标签转成八类生活圈设施的权重，
+                保证每一分权重都能向用户解释来源。
+              items:
+                type: string
+                enum: [cook_often, eat_out, fitness, night_owl, online_shopping, has_child, has_pet, elder_care, health_sensitive, quiet_preference, car_owner, homebody]
+
+        priority_ranking:
+          type: array
+          description: 四个维度按重要性从高到低排序，必须四项齐全且不重复
+          items: { type: string, enum: [commute, facility, rent, quality] }
+          minItems: 4
+          maxItems: 4
+
+        notes:
+          type: string
+          description: 无法归入结构化字段的补充信息
+
+        completeness:
+          type: object
+          properties:
+            required_filled: { type: boolean }
+            missing:
+              type: array
+              items: { type: string }
+            confidence:
+              type: number
+              description: >
+                用户明确回答的字段占比。大量走默认值（用户反复说"随便"）时应显著低于 1，
+                前端会据此提示"部分条件为系统推测"。请如实填写，不要一律填 1。

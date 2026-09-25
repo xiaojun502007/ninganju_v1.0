@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { AmapRouteMap } from "../components/AmapRouteMap";
+import { EvaluationHistoryTable } from "../components/EvaluationHistoryTable";
+import { RecommendationSidebar } from "../components/layout/RecommendationSidebar";
 import { CommuteInfoPanel } from "../components/CommuteInfoPanel";
 import { FacilityRadarChart } from "../components/FacilityRadarChart";
-import { getCommuteData, type CommuteData, type CommuteMode } from "../services/commuteService";
+import { getCommuteData, type CommuteData, type CommuteLocation, type CommuteMode } from "../services/commuteService";
 import {
   deleteEvaluationHistory,
   listEvaluationHistory,
@@ -10,19 +12,24 @@ import {
   type EvaluationHistoryRecord
 } from "../services/evaluationHistoryService";
 import { getFacilityData, type FacilityData } from "../services/facilityService";
+import { calculateRentFitScore, calculateRentOverlapScore } from "../utils/rentScore";
 
 type AnalysisPageProps = {
   areaName: string;
+  areaLocation: CommuteLocation | null;
   preferenceId?: string;
   onBack: () => void;
-  onOpenHistoryRecord: (preferenceId: string, areaName: string) => void;
+  onOpenProfile: () => void;
+  onOpenHistoryRecord: (preferenceId: string, areaName: string, areaLocation: CommuteLocation | null) => void;
   username: string;
 };
 
 export function AnalysisPage({
   areaName,
+  areaLocation,
   preferenceId = "",
   onBack,
+  onOpenProfile,
   onOpenHistoryRecord,
   username
 }: AnalysisPageProps) {
@@ -37,7 +44,10 @@ export function AnalysisPage({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyMessage, setHistoryMessage] = useState("");
   const [overviewCommuteScore, setOverviewCommuteScore] = useState<number | undefined>(undefined);
-  const areaLocationForFacilities = commuteData?.areaLocation || null;
+  const areaLocationForFacilities = areaLocation || commuteData?.areaLocation || null;
+  const selectedLocationKey = areaLocation
+    ? `${areaLocation.lng.toFixed(6)},${areaLocation.lat.toFixed(6)}`
+    : "";
   const areaLocationKey = areaLocationForFacilities
     ? `${areaLocationForFacilities.lng.toFixed(6)},${areaLocationForFacilities.lat.toFixed(6)}`
     : "";
@@ -47,7 +57,13 @@ export function AnalysisPage({
   const facilityScore = calculateFacilityTotalScore(facilityData?.poiSummary || []);
   const facilityScoreText = facilityScore == null ? "--" : String(facilityScore);
   const facilityScoreDesc = facilityLoading ? "正在计算设施得分" : getFacilityScoreDesc(facilityScore);
-  const totalScore = calculateRentFitScore(commuteScore, facilityScore);
+  const rentResult = calculateRentOverlapScore(commuteData?.rentContext);
+  const rentScore = rentResult?.score ?? null;
+  const rentScoreText = rentScore == null ? "--" : String(rentScore);
+  const rentScoreDesc = rentResult
+    ? `${commuteData?.rentContext?.housingType || "所选房型"}租金与预算重叠${Math.round(rentResult.overlapRatio * 100)}%`
+    : "暂无可用的房型租金区间";
+  const totalScore = calculateRentFitScore(commuteScore, facilityScore, rentScore);
   const totalScoreText = totalScore == null ? "--" : String(totalScore);
   const totalScoreDesc = totalScore == null && (commuteLoading || facilityLoading) ? "正在计算适配总分" : getRentFitScoreDesc(totalScore);
   const recommendationArea = commuteData?.recommendationArea;
@@ -63,7 +79,7 @@ export function AnalysisPage({
 
     setCommuteLoading(true);
     setCommuteError("");
-    getCommuteData(preferenceId, areaName, commuteMode)
+    getCommuteData(preferenceId, areaName, commuteMode, areaLocation)
       .then((data) => {
         setCommuteData(data);
         if (data.commuteScoreResult?.commuteScore != null) {
@@ -76,13 +92,13 @@ export function AnalysisPage({
         setCommuteError(error.message);
       })
       .finally(() => setCommuteLoading(false));
-  }, [areaName, commuteMode, preferenceId]);
+  }, [areaName, commuteMode, preferenceId, selectedLocationKey]);
 
   useEffect(() => {
     setOverviewCommuteScore(undefined);
     setFacilityData(null);
     setFacilityError("");
-  }, [areaName, preferenceId]);
+  }, [areaName, preferenceId, selectedLocationKey]);
 
   useEffect(() => {
     if (!preferenceId || !areaLocationForFacilities) {
@@ -90,18 +106,27 @@ export function AnalysisPage({
       return;
     }
 
+    let cancelled = false;
     setFacilityLoading(true);
     setFacilityError("");
     getFacilityData(preferenceId, areaName, areaLocationForFacilities)
       .then((data) => {
+        if (cancelled) return;
         setFacilityData(data);
-        setFacilityError(data.message || "");
+        setFacilityError("");
       })
       .catch((error: Error) => {
+        if (cancelled) return;
         setFacilityData(null);
         setFacilityError(error.message);
       })
-      .finally(() => setFacilityLoading(false));
+      .finally(() => {
+        if (!cancelled) setFacilityLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [areaName, areaLocationKey, preferenceId]);
 
   useEffect(() => {
@@ -118,7 +143,7 @@ export function AnalysisPage({
   };
 
   const handleSaveEvaluation = async () => {
-    if (totalScore == null || commuteScore == null || facilityScore == null) {
+    if (totalScore == null || commuteScore == null || facilityScore == null || rentScore == null) {
       setHistoryMessage("当前片区评分还没有计算完成，请稍后再保存。");
       return;
     }
@@ -136,7 +161,8 @@ export function AnalysisPage({
           preferenceId,
           areaName,
           recommendationArea: commuteData?.recommendationArea || null,
-          areaLocation: commuteData?.areaLocation || null
+          areaLocation: areaLocationForFacilities,
+          rentScore
         }
       });
       await refreshEvaluationHistory();
@@ -163,16 +189,23 @@ export function AnalysisPage({
   };
 
   const handleOpenHistoryRecord = (record: EvaluationHistoryRecord) => {
-    onOpenHistoryRecord(record.otherInfo?.preferenceId || preferenceId, record.regionName);
+    onOpenHistoryRecord(
+      record.otherInfo?.preferenceId || preferenceId,
+      record.regionName,
+      record.otherInfo?.areaLocation || null
+    );
   };
 
   return (
+    <div className="analysis-workspace">
+      <RecommendationSidebar
+        active="history"
+        onOpenProfile={onOpenProfile}
+        onOpenRecommendation={onBack}
+        onOpenHistory={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+      />
     <section className="analysis-page evaluation-page">
-      <button className="outline-orange restart-button" onClick={onBack} type="button">
-        重新推荐
-      </button>
-
-      <SectionTitle index="I" title="片区总体得分" />
+      <SectionTitle title="片区总体得分" />
       <div className="evaluation-overview">
         <div className="area-intro">
           <h1>
@@ -188,16 +221,17 @@ export function AnalysisPage({
         </div>
 
         <div className="score-summary">
-          <ScoreCard tone="orange" icon="train" title="租住适配总分" value={totalScoreText} desc={totalScoreDesc} />
+          <ScoreCard featured tone="orange" icon="train" title="租住适配总分" value={totalScoreText} desc={totalScoreDesc} />
+          <ScoreCard tone="amber" icon="bag" title="租金适配得分" value={rentScoreText} desc={rentScoreDesc} />
           <ScoreCard tone="blue" icon="metro" title="通勤得分" value={commuteScoreText} desc={commuteScoreDesc} />
           <ScoreCard tone="green" icon="bag" title="生活圈设施得分" value={facilityScoreText} desc={facilityScoreDesc} />
         </div>
       </div>
 
-      <SectionTitle index="II" title="职住通勤情况" />
+      <SectionTitle title="职住通勤情况" />
       <div className="commute-section-grid">
         <AmapRouteMap
-          areaLocation={commuteData?.areaLocation || null}
+          areaLocation={commuteData?.areaLocation || areaLocation}
           commute={commuteData?.commute || null}
           isLoading={commuteLoading}
           workLocation={commuteData?.workLocation || null}
@@ -211,7 +245,7 @@ export function AnalysisPage({
         />
       </div>
 
-      <SectionTitle index="III" title="生活圈设施情况" />
+      <SectionTitle title="生活圈设施情况" />
       <div className="life-section-grid">
         <section className="radar-card">
           <h2>8维生活圈评分</h2>
@@ -263,69 +297,80 @@ export function AnalysisPage({
         </section>
       </div>
 
-      <button
-        className="save-button evaluation-save"
-        disabled={historyLoading || totalScore == null || commuteScore == null || facilityScore == null}
-        onClick={handleSaveEvaluation}
-        type="button"
-      >
-        {historyLoading ? "正在处理评估记录..." : "保存本次片区评估结果"}
-      </button>
+      <div className="evaluation-actions">
+        <button className="outline-orange restart-button" onClick={onBack} type="button">
+          重新推荐
+        </button>
+        <button
+          className="save-button evaluation-save"
+          disabled={historyLoading || totalScore == null || commuteScore == null || facilityScore == null || rentScore == null}
+          onClick={handleSaveEvaluation}
+          type="button"
+        >
+          {historyLoading ? "正在处理评估记录..." : "保存本次片区评估结果"}
+        </button>
+      </div>
 
-      <section className="history-record">
-        <h2>我的评估记录</h2>
+      <SectionTitle title="查看具体房源链接" />
+      <div className="housing-platform-links">
+        <a className="housing-platform-link beike" href="https://www.ke.com/" target="_blank" rel="noopener noreferrer" aria-label="前往贝壳找房官网首页">
+          <PlatformIcon src="https://www.ke.com/favicon.ico" fallback="/images/platform-beike.svg" />
+          <span className="housing-platform-name">贝壳找房</span>
+          <span className="housing-platform-enter">点击进入 <span aria-hidden="true">↗</span></span>
+        </a>
+        <a className="housing-platform-link anjuke" href="https://www.anjuke.com/" target="_blank" rel="noopener noreferrer" aria-label="前往安居客官网首页">
+          <PlatformIcon src="https://www.anjuke.com/favicon.ico" fallback="/images/platform-anjuke.svg" />
+          <span className="housing-platform-name">安居客</span>
+          <span className="housing-platform-enter">点击进入 <span aria-hidden="true">↗</span></span>
+        </a>
+        <a className="housing-platform-link ziroom" href="https://www.ziroom.com/" target="_blank" rel="noopener noreferrer" aria-label="前往自如官网首页">
+          <PlatformIcon src="https://www.ziroom.com/favicon.ico" fallback="/images/platform-ziroom.svg" />
+          <span className="housing-platform-name">自如</span>
+          <span className="housing-platform-enter">点击进入 <span aria-hidden="true">↗</span></span>
+        </a>
+        <a className="housing-platform-link lianjia" href="https://www.lianjia.com/" target="_blank" rel="noopener noreferrer" aria-label="前往链家官网首页">
+          <PlatformIcon src="https://www.lianjia.com/favicon.ico" fallback="/images/platform-lianjia.svg" />
+          <span className="housing-platform-name">链家</span>
+          <span className="housing-platform-enter">点击进入 <span aria-hidden="true">↗</span></span>
+        </a>
+      </div>
+
+      <SectionTitle title="查看推荐微社区记录" />
+      <section className="history-record" id="evaluation-history-record">
         {historyMessage && <p className="history-message">{historyMessage}</p>}
-        <div className="record-table">
-          <div className="record-head">
-            <span>片区</span>
-            <span>总分</span>
-            <span>通勤分</span>
-            <span>设施分</span>
-            <span>保存时间</span>
-            <span>操作</span>
-          </div>
-          {historyRecords.length === 0 && (
-            <div className="record-row record-empty">
-              <span>暂无评估记录</span>
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
-            </div>
-          )}
-          {historyRecords.map((record) => (
-            <div className="record-row" key={record.id}>
-              <span>{record.regionName}</span>
-              <b className="orange-text">{record.totalScore}</b>
-              <b className="blue-text">{record.commuteScore}</b>
-              <b className="green-text">{record.facilityScore}</b>
-              <span>{record.time}</span>
-              <span>
-                <button onClick={() => handleOpenHistoryRecord(record)} type="button">
-                  查看详情
-                </button>
-                <button disabled={historyLoading} onClick={() => handleDeleteEvaluation(record.id)} type="button">
-                  删除
-                </button>
-              </span>
-            </div>
-          ))}
-        </div>
+        <EvaluationHistoryTable
+          records={historyRecords}
+          loading={historyLoading}
+          onOpen={handleOpenHistoryRecord}
+          onDelete={handleDeleteEvaluation}
+        />
       </section>
 
       <p className="analysis-note">评分基于大数据与AI模型综合评估，仅供参考，请结合个人需求理性决策。</p>
     </section>
+    </div>
   );
 }
 
-function SectionTitle({ index, title }: { index: string; title: string }) {
+function SectionTitle({ title }: { title: string }) {
   return (
     <div className="section-title">
-      <strong>{index}</strong>
       <h2>{title}</h2>
-      <i />
     </div>
+  );
+}
+
+function PlatformIcon({ src, fallback }: { src: string; fallback: string }) {
+  return (
+    <img
+      className="housing-platform-icon"
+      src={src}
+      alt=""
+      aria-hidden="true"
+      onError={(event) => {
+        if (!event.currentTarget.src.endsWith(fallback)) event.currentTarget.src = fallback;
+      }}
+    />
   );
 }
 
@@ -364,11 +409,6 @@ function getFacilityScoreDesc(score: number | null) {
   return "设施配置欠缺";
 }
 
-function calculateRentFitScore(commuteScore?: number, facilityScore?: number | null) {
-  if (commuteScore == null || facilityScore == null) return null;
-  return Math.round(commuteScore * 0.5 + facilityScore * 0.5);
-}
-
 function getRentFitScoreDesc(score: number | null) {
   if (score == null) return "等待综合评估结果";
   if (score > 90) return "非常适合";
@@ -378,12 +418,14 @@ function getRentFitScoreDesc(score: number | null) {
 }
 
 function ScoreCard({
+  featured = false,
   tone,
   icon,
   title,
   value,
   desc
 }: {
+  featured?: boolean;
   tone: string;
   icon: string;
   title: string;
@@ -391,7 +433,7 @@ function ScoreCard({
   desc: string;
 }) {
   return (
-    <article className="summary-card">
+    <article className={`summary-card${featured ? " featured" : ""}`}>
       <span className={`summary-icon ${tone} ${icon}`} />
       <div>
         <h3>{title}</h3>

@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "宁安居租房偏好契约 v1.0",
+  "description": "Agent A（对话采集）的唯一产出，也是 Agent B（地段评估工作流）的唯一入参。两个 Agent 之间只认这份契约。",
+  "type": "object",
+  "required": ["schema_version", "work", "budget", "commute"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "session_id": { "type": "string", "description": "百炼会话 ID，用于把偏好和对话记录关联" },
+    "collected_at": { "type": "string", "format": "date-time" },
+
+    "work": {
+      "type": "object",
+      "required": ["address_raw", "address_query"],
+      "properties": {
+        "address_raw": { "type": "string", "description": "用户原话，保留不动，用于展示" },
+        "address_query": { "type": "string", "description": "规范化后用于高德地理编码的地址，必须包含可定位的实体名（写字楼/园区/校区/地铁站），不能只有区名" },
+        "district": { "type": ["string", "null"], "description": "南京行政区，可空" }
+      }
+    },
+
+    "budget": {
+      "type": "object",
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 0 },
+        "period": { "type": "string", "enum": ["month"], "default": "month" },
+        "include_utilities": { "type": "boolean", "default": false, "description": "预算是否已含水电物业" }
+      }
+    },
+
+    "commute": {
+      "type": "object",
+      "required": ["max_minutes"],
+      "properties": {
+        "max_minutes": { "type": "integer", "minimum": 5, "maximum": 180, "description": "单程可接受通勤时长（分钟）。比公里数更贴近真实决策，务必问到这个而不是距离" },
+        "preferred_modes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["transit", "driving", "riding", "walking"] },
+          "default": ["transit"],
+          "description": "transit=地铁公交, driving=自驾, riding=电动车/骑行, walking=步行"
+        },
+        "metro_walk_max_meters": { "type": ["integer", "null"], "default": null, "description": "可接受的到地铁站步行距离（米），不在意则为 null" },
+        "transfer_tolerance": { "type": ["integer", "null"], "default": null, "description": "可接受换乘次数，不在意则为 null" }
+      }
+    },
+
+    "housing": {
+      "type": "object",
+      "properties": {
+        "rent_type": { "type": "string", "enum": ["整租", "合租", "不限"], "default": "不限" },
+        "layout": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["开间", "一室一厅", "两室一厅", "三室及以上", "合租主卧", "合租次卧"] }
+        },
+        "area_min_sqm": { "type": ["number", "null"] },
+        "must_have": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["独立卫生间", "独立厨房", "电梯", "空调", "洗衣机", "家电齐全", "可养宠物", "南向采光", "可短租", "有阳台"] },
+          "description": "硬性要求，用于房源检索的过滤条件"
+        },
+        "deal_breakers": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["群租", "地下室", "无电梯高层", "隔断房", "临街嘈杂", "老破小", "无独卫"] }
+        },
+        "move_in_date": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+
+    "profile": {
+      "type": "object",
+      "properties": {
+        "identity": { "type": ["string", "null"], "enum": ["应届毕业生", "职场新人", "工作多年", "情侣同住", "有娃家庭", "在读学生", null] },
+        "work_schedule": { "type": ["string", "null"], "enum": ["朝九晚五", "弹性工时", "加班较多", "倒班", "远程为主", null] },
+        "lifestyle_tags": {
+          "type": "array",
+          "description": "受控词表，只能从下列枚举中选。Agent A 不需要计算权重，facility_weights 由 Agent B 的代码节点按确定性规则推导，保证可解释、可复现。",
+          "items": {
+            "type": "string",
+            "enum": [
+              "cook_often", "eat_out", "fitness", "night_owl", "online_shopping",
+              "has_child", "has_pet", "elder_care", "health_sensitive",
+              "quiet_preference", "car_owner", "homebody"
+            ]
+          }
+        }
+      }
+    },
+
+    "priority_ranking": {
+      "type": "array",
+      "description": "用户对四个维度的重要性排序，从最重要到最不重要。代码节点会转成 [0.40, 0.28, 0.20, 0.12] 的权重。让模型排序比让模型给小数可靠得多。",
+      "items": { "type": "string", "enum": ["commute", "facility", "rent", "quality"] },
+      "minItems": 4,
+      "maxItems": 4
+    },
+
+    "notes": { "type": "string", "description": "无法归入结构化字段的用户原话补充" },
+
+    "completeness": {
+      "type": "object",
+      "properties": {
+        "required_filled": { "type": "boolean" },
+        "missing": { "type": "array", "items": { "type": "string" } },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "用户明确回答的比例。大量走默认值时应显著低于 1，供前端提示'部分条件为推测值'" }
+      }
+    }
+  }
+}
