@@ -1,8 +1,8 @@
 import { FormEvent, useState } from "react";
-import { loginUser, registerUser } from "../services/authService";
+import { changePassword, loginUser, registerUser } from "../services/authService";
 
 type LoginPageProps = {
-  onLogin: (username: string, role: "user" | "admin") => void;
+  onLogin: (username: string, role: "user" | "admin", sessionToken: string) => void;
 };
 
 export function LoginPage({ onLogin }: LoginPageProps) {
@@ -12,6 +12,8 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [loginMessage, setLoginMessage] = useState("");
   const [registerOpen, setRegisterOpen] = useState(false);
+  const [changePasswordOpen, setChangePasswordOpen] = useState(false);
+  const [passwordChangeNotice, setPasswordChangeNotice] = useState("");
 
   const handleLogin = async (event: FormEvent) => {
     event.preventDefault();
@@ -19,7 +21,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
 
     try {
       const result = await loginUser(loginUsername.trim(), loginPassword);
-      onLogin(result.user?.username || loginUsername.trim(), result.user?.role || "user");
+      onLogin(result.user?.username || loginUsername.trim(), result.user?.role || "user", result.sessionToken || "");
     } catch (error) {
       setLoginMessage(error instanceof Error ? error.message : "登录失败，请稍后重试");
     }
@@ -44,19 +46,6 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           <Benefit icon="briefcase" title="通勤与生活圈评估" text="多维度评估片区通勤效率与生活便利，住得近也要过得好" />
           <Benefit icon="clock" title="历史记录随时查看" text="保存你的推荐结果与筛选偏好，方便下次快速查看" />
         </div>
-      </div>
-
-      <div className="nanjing-scene" aria-hidden="true">
-        <div className="sun" />
-        <div className="skyline">
-          <span className="tower tall" />
-          <span className="tower mid" />
-          <span className="tower slim" />
-          <span className="pagoda left" />
-          <span className="pagoda right" />
-        </div>
-        <div className="bridge" />
-        <div className="water" />
       </div>
 
       <aside className="login-card">
@@ -104,10 +93,11 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               />
               记住我
             </label>
-            <button type="button">忘记密码？</button>
+            <button type="button" onClick={() => { setPasswordChangeNotice(""); setChangePasswordOpen(true); }}>修改密码</button>
           </div>
 
           {loginMessage && <div className="auth-message error">{loginMessage}</div>}
+          {passwordChangeNotice && <div className="auth-message" role="status">{passwordChangeNotice}</div>}
 
           <button className="primary-action" type="submit">
             登 录
@@ -150,7 +140,91 @@ export function LoginPage({ onLogin }: LoginPageProps) {
       </footer>
 
       {registerOpen && <RegisterDialog onClose={() => setRegisterOpen(false)} />}
+      {changePasswordOpen && (
+        <ChangePasswordDialog
+          initialUsername={loginUsername}
+          onClose={() => setChangePasswordOpen(false)}
+          onSuccess={(username) => {
+            setChangePasswordOpen(false);
+            setLoginUsername(username);
+            setLoginPassword("");
+            setLoginMessage("");
+            setPasswordChangeNotice("密码已修改，请用新密码登录");
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function ChangePasswordDialog({ initialUsername, onClose, onSuccess }: {
+  initialUsername: string;
+  onClose: () => void;
+  onSuccess: (username: string) => void;
+}) {
+  const [username, setUsername] = useState(initialUsername);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [message, setMessage] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    setMessage("");
+    const trimmedUsername = username.trim();
+    if (!trimmedUsername || !currentPassword || !newPassword || !confirmPassword) {
+      setMessage("请填写全部信息");
+      return;
+    }
+    if (newPassword.length < 8) {
+      setMessage("新密码至少需要8位");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setMessage("两次输入的新密码不一致");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      await changePassword(trimmedUsername, currentPassword, newPassword, confirmPassword);
+      onSuccess(trimmedUsername);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "密码修改失败，请稍后重试");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="修改密码">
+      <form className="register-dialog" onSubmit={handleSubmit}>
+        <div className="dialog-title-row">
+          <div><h2>修改密码</h2><p>请先验证当前密码，以保护你的账号</p></div>
+          <button className="dialog-close" onClick={onClose} type="button" aria-label="关闭修改密码界面">×</button>
+        </div>
+        <label className="dialog-field">
+          <span>用户名</span>
+          <input autoComplete="username" autoFocus maxLength={16} onChange={(event) => setUsername(event.target.value)} value={username} />
+        </label>
+        <label className="dialog-field">
+          <span>当前密码</span>
+          <input autoComplete="current-password" onChange={(event) => setCurrentPassword(event.target.value)} type="password" value={currentPassword} />
+        </label>
+        <label className="dialog-field">
+          <span>新密码</span>
+          <input autoComplete="new-password" minLength={8} onChange={(event) => setNewPassword(event.target.value)} type="password" value={newPassword} />
+        </label>
+        <label className="dialog-field">
+          <span>确认密码</span>
+          <input autoComplete="new-password" onChange={(event) => setConfirmPassword(event.target.value)} type="password" value={confirmPassword} />
+        </label>
+        {message && <div className="auth-message error" role="alert">{message}</div>}
+        <button className="register-submit" disabled={isSubmitting} type="submit">
+          {isSubmitting ? "修改中..." : "确认修改"}
+        </button>
+      </form>
+    </div>
   );
 }
 

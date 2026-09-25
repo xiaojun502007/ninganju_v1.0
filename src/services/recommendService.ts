@@ -1,4 +1,5 @@
 import type {
+  RentDemandJson,
   RecommendAreasResponse,
   RecommendationHistoryRecord,
   RecommendationPreference
@@ -15,7 +16,7 @@ function getApiBaseUrl() {
   return localHosts.has(window.location.hostname) ? LOCAL_API_BASE_URL : "";
 }
 
-export async function recommendAreas(preference: RecommendationPreference) {
+export async function recommendAreas(preference: RentDemandJson) {
   const response = await fetch(`${getApiBaseUrl()}/api/recommend-areas`, {
     method: "POST",
     headers: {

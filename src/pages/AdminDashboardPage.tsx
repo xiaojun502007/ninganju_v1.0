@@ -118,9 +118,46 @@ export function AdminDashboardPage() {
           accent="blue"
           label="当日片区评价次数"
           value={dashboardData?.todayMetrics.areaEvaluations ?? 0}
-          note="点击生成推荐片区后记录"
+          note="推荐工作流调用次数 × 9 个微社区"
+        />
+        <MetricCard
+          accent="orange"
+          label="当日查看片区详情次数"
+          value={dashboardData?.todayMetrics.detailViews ?? 0}
+          note="点击查看微社区详情时记录"
+        />
+        <MetricCard
+          accent="green"
+          label="当日推荐工作流调用次数"
+          value={dashboardData?.todayMetrics.workflowCalls ?? 0}
+          note="每次提交推荐需求计 1 次"
+        />
+        <MetricCard
+          accent="blue"
+          label="当日高德 API 总调用次数"
+          value={dashboardData?.todayMetrics.amapApiCalls ?? 0}
+          note="地图、地点搜索及后端请求次数"
         />
       </div>
+
+      <section className="admin-login-card">
+        <div className="admin-section-head"><h2>最近用户登录记录</h2><span>最近 5 条 · 推荐次数按用户累计</span></div>
+        <div className="admin-login-table-wrap">
+          <table className="admin-login-table">
+            <thead><tr><th>用户名</th><th>使用片区推荐的次数</th><th>登录时间</th></tr></thead>
+            <tbody>
+              {(dashboardData?.recentLogins || []).map((item) => (
+                <tr key={item.id}>
+                  <td>{item.username}</td>
+                  <td>{item.recommendationCount}</td>
+                  <td>{formatLoginTime(item.loginTime)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!isLoading && dashboardData?.recentLogins.length === 0 && <p className="admin-empty">暂无登录记录</p>}
+        </div>
+      </section>
 
       <section className="admin-chart-card">
         <div className="admin-section-head">
@@ -152,6 +189,15 @@ export function AdminDashboardPage() {
       </section>
     </section>
   );
+}
+
+function formatLoginTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  }).format(date);
 }
 
 function MetricCard({

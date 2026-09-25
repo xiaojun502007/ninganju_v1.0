@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { CommuteLocation, CommuteSummary } from "../services/commuteService";
+import { recordAmapClientCall } from "../services/amapMetricService";
 
 declare global {
   interface Window {
@@ -66,7 +67,7 @@ function loadAmapScript(jsKey: string, securityCode?: string, attempt = 1): Prom
   });
 }
 
-async function loadAmap() {
+export async function loadAmap() {
   if (window.AMap) {
     return Promise.resolve(window.AMap);
   }
@@ -114,6 +115,7 @@ export function AmapRouteMap({ workLocation, areaLocation, commute, isLoading }:
           zoom: 12,
           viewMode: "2D"
         });
+        recordAmapClientCall();
         mapInstanceRef.current = map;
         map.addControl(new AMap.Scale());
         map.addControl(new AMap.ToolBar({ position: { right: "16px", top: "16px" } }));

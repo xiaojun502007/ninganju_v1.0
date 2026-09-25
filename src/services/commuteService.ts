@@ -41,6 +41,14 @@ export type RecommendationAreaBrief = {
   tags: string[];
 };
 
+export type RentContext = {
+  budgetMin: number;
+  budgetMax: number;
+  housingType: string;
+  rentMin: number | null;
+  rentMax: number | null;
+};
+
 export type CommuteData = {
   success: boolean;
   workLocation: CommuteLocation | null;
@@ -48,6 +56,7 @@ export type CommuteData = {
   commute: CommuteSummary | null;
   commuteScoreResult?: CommuteScoreResult | null;
   recommendationArea?: RecommendationAreaBrief | null;
+  rentContext?: RentContext | null;
   message?: string;
 };
 
@@ -62,13 +71,18 @@ function getApiBaseUrl() {
   return new Set(["127.0.0.1", "localhost"]).has(window.location.hostname) ? LOCAL_API_BASE_URL : "";
 }
 
-export async function getCommuteData(preferenceId: string, areaName: string, mode: CommuteMode = "driving") {
+export async function getCommuteData(
+  preferenceId: string,
+  areaName: string,
+  mode: CommuteMode = "driving",
+  areaLocation: CommuteLocation | null = null
+) {
   const response = await fetch(`${getApiBaseUrl()}/api/commute`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ preferenceId, areaName, mode })
+    body: JSON.stringify({ preferenceId, areaName, mode, areaLocation })
   });
 
   const data = (await response.json()) as CommuteData;

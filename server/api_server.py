@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import math
 import os
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib import error, parse, request
 
 
@@ -19,7 +23,11 @@ DB_PATH = ROOT_DIR / "ninganju_auth.db"
 HOST = "127.0.0.1"
 PORT = 8787
 COZE_DEFAULT_BASE_URL = "https://api.coze.cn"
-COZE_DEFAULT_WORKFLOW_ID = "7640105893560958985"
+COZE_DEFAULT_WORKFLOW_ID = "7684482984275542051"
+COZE_DEFAULT_APP_ID = "7684185393868439603"
+PROFILE_SESSION_SECONDS = 12 * 60 * 60
+_profile_sessions: dict[str, tuple[str, float]] = {}
+_profile_session_lock = threading.Lock()
 
 
 FALLBACK_AREAS: list[dict[str, Any]] = [
@@ -86,10 +94,15 @@ def recent_day_keys(days: int = 7) -> list[str]:
     return [(today - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in reversed(range(days))]
 
 
-def get_connection() -> sqlite3.Connection:
+@contextmanager
+def get_connection() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def increment_metric(metric_name: str) -> None:
@@ -102,6 +115,47 @@ def increment_metric(metric_name: str) -> None:
             """,
             (metric_name, today_key()),
         )
+
+
+def open_amap_url(url: str, timeout: int):
+    """Count each outbound AMap Web Service request attempt, including retries."""
+    increment_metric("amap_api_call")
+    return request.urlopen(url, timeout=timeout)
+
+
+def record_user_activity(
+    username: str, event_type: str, preference_id: str | None = None, area_name: str | None = None
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            insert into user_activity (username, event_type, preference_id, area_name, created_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            (username, event_type, preference_id, area_name, utc_now()),
+        )
+
+
+def create_profile_session(username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    with _profile_session_lock:
+        _profile_sessions[token] = (username, time.time() + PROFILE_SESSION_SECONDS)
+    return token
+
+
+def profile_session_username(auth_header: str) -> str | None:
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:].strip()
+    with _profile_session_lock:
+        session = _profile_sessions.get(token)
+        if not session:
+            return None
+        username, expires_at = session
+        if expires_at <= time.time():
+            _profile_sessions.pop(token, None)
+            return None
+        return username
 
 
 def init_db() -> None:
@@ -123,11 +177,19 @@ def init_db() -> None:
             """
             create table if not exists rent_preference (
                 id text primary key,
+                user_nickname text not null default '',
                 work_address text not null,
                 work_lng real,
                 work_lat real,
                 budget_min integer not null,
                 budget_max integer not null,
+                commute_distance_min integer not null default 1,
+                commute_distance_max integer not null default 30,
+                facility_preferences text not null default '[]',
+                transport_preference text not null default '',
+                housing_type text not null default '',
+                other_demand text not null default '',
+                preference_json text not null default '{}',
                 commute_range text not null,
                 priority text not null,
                 markdown_prompt text not null,
@@ -140,6 +202,22 @@ def init_db() -> None:
             conn.execute("alter table rent_preference add column work_lng real")
         if "work_lat" not in columns:
             conn.execute("alter table rent_preference add column work_lat real")
+        rent_preference_columns = {
+            "user_nickname": "text not null default ''",
+            "commute_distance_min": "integer not null default 1",
+            "commute_distance_max": "integer not null default 30",
+            "facility_preferences": "text not null default '[]'",
+            "transport_preference": "text not null default ''",
+            "housing_type": "text not null default ''",
+            "other_demand": "text not null default ''",
+            "preference_json": "text not null default '{}'",
+        }
+        for column_name, column_definition in rent_preference_columns.items():
+            if column_name not in columns:
+                conn.execute(f"alter table rent_preference add column {column_name} {column_definition}")
+        conn.execute(
+            "create index if not exists idx_rent_preference_user_created on rent_preference(user_nickname, created_at)"
+        )
         conn.execute(
             """
             create table if not exists recommendation_result (
@@ -198,6 +276,38 @@ def init_db() -> None:
         conn.execute("create index if not exists idx_evaluation_history_user_time on evaluation_history(username, time)")
         conn.execute(
             """
+            create table if not exists user_activity (
+                id integer primary key autoincrement,
+                username text not null,
+                event_type text not null,
+                preference_id text,
+                area_name text,
+                created_at text not null
+            )
+            """
+        )
+        conn.execute(
+            "create index if not exists idx_user_activity_user_type on user_activity(username, event_type, created_at)"
+        )
+        conn.execute(
+            """
+            create table if not exists user_login (
+                id integer primary key autoincrement,
+                username text not null,
+                login_time text not null,
+                unique(username, login_time)
+            )
+            """
+        )
+        conn.execute("create index if not exists idx_user_login_time on user_login(login_time desc, id desc)")
+        conn.execute(
+            """
+            insert or ignore into user_login (username, login_time)
+            select username, created_at from user_activity where event_type = 'login'
+            """
+        )
+        conn.execute(
+            """
             create table if not exists operation_metrics (
                 id integer primary key autoincrement,
                 metric_name text not null,
@@ -221,10 +331,7 @@ def init_db() -> None:
             """
             insert into users (username, password_hash, salt, role, created_at)
             values (?, ?, ?, 'user', ?)
-            on conflict(username) do update set
-                password_hash = excluded.password_hash,
-                salt = excluded.salt,
-                role = 'user'
+            on conflict(username) do nothing
             """,
             ("xiaoning", hash_password("12345678", demo_salt), demo_salt, utc_now()),
         )
@@ -233,17 +340,22 @@ def init_db() -> None:
             """
             insert into users (username, password_hash, salt, role, created_at)
             values (?, ?, ?, 'admin', ?)
-            on conflict(username) do update set
-                password_hash = excluded.password_hash,
-                salt = excluded.salt,
-                role = 'admin'
+            on conflict(username) do nothing
             """,
             ("administrator", hash_password("220250246@xj", admin_salt), admin_salt, utc_now()),
         )
 
 
 def hash_password(password: str, salt: str) -> str:
-    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 260_000)
+    return f"pbkdf2_sha256${digest.hex()}"
+
+
+def verify_password(password: str, salt: str, stored_hash: str) -> bool:
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        return hmac.compare_digest(hash_password(password, salt), stored_hash)
+    legacy_hash = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy_hash, stored_hash)
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -255,7 +367,7 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[st
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Access-Control-Allow-Origin", allowed_origin)
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -277,50 +389,83 @@ def validate_username(username: str) -> str | None:
 
 
 def validate_preference(data: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    work_address = str(data.get("workAddress", "")).strip()
-    commute_range = str(data.get("commuteRange", "")).strip()
-    priority = str(data.get("priority", "")).strip()
+    user_nickname = str(data.get("user_nickname", data.get("userNickname", ""))).strip()
+    work_address = str(data.get("work_address", data.get("workAddress", ""))).strip()
+    facility_preferences = data.get("facility_preferences", [])
+    transport_preference = str(data.get("transport_preference", "")).strip()
+    housing_type = str(data.get("housing_type", "")).strip()
     try:
-        budget_min = int(data.get("budgetMin", 0))
-        budget_max = int(data.get("budgetMax", 0))
+        budget_min = int(data.get("budget_min", data.get("budgetMin", 0)))
+        budget_max = int(data.get("budget_max", data.get("budgetMax", 0)))
+        commute_distance_min = int(data.get("commute_distance_min", 0))
+        commute_distance_max = int(data.get("commute_distance_max", 0))
     except (TypeError, ValueError):
-        return None, "月租预算必须是数字"
+        return None, "租金预算和通勤距离必须是数字"
 
+    if not user_nickname:
+        return None, "缺少登录用户名"
     if not work_address:
         return None, "请填写工作地址"
-    if budget_min < 0 or budget_max <= budget_min:
+    if budget_min < 500 or budget_max <= budget_min:
         return None, "请填写有效的月租预算区间"
-    if commute_range not in {"3km", "5km", "10km", "15km", "15km+"}:
-        return None, "请选择可接受通勤距离"
-    if priority not in {"靠近工作地", "靠近地铁站", "周边生活便利", "居住品质高"}:
-        return None, "请选择租房最看重因素"
+    if commute_distance_min < 1 or commute_distance_max <= commute_distance_min:
+        return None, "请填写有效的通勤距离区间"
+    if not isinstance(facility_preferences, list) or not facility_preferences:
+        return None, "请至少选择一项周边设施"
+    facility_preferences = [str(item).strip() for item in facility_preferences if str(item).strip()]
+    if not facility_preferences:
+        return None, "请至少选择一项周边设施"
+    if transport_preference not in {"步行", "自行车/电动车", "公交车", "地铁", "自驾/打车"}:
+        return None, "请选择上下班交通方式"
+    if housing_type not in {"单身公寓", "一居室普通住宅", "两居室普通住宅"}:
+        return None, "请选择期望租住的房型"
+
+    if commute_distance_max <= 3:
+        commute_range = "3km"
+    elif commute_distance_max <= 5:
+        commute_range = "5km"
+    elif commute_distance_max <= 10:
+        commute_range = "10km"
+    elif commute_distance_max <= 15:
+        commute_range = "15km"
+    else:
+        commute_range = "15km+"
 
     return {
-        "workAddress": work_address,
-        "budgetMin": budget_min,
-        "budgetMax": budget_max,
-        "commuteRange": commute_range,
-        "priority": priority,
+        "user_nickname": user_nickname,
+        "work_address": work_address,
+        "budget_max": budget_max,
+        "budget_min": budget_min,
+        "commute_distance_max": commute_distance_max,
+        "commute_distance_min": commute_distance_min,
+        "facility_preferences": facility_preferences,
+        "transport_preference": transport_preference,
+        "housing_type": housing_type,
+        "commute_range": commute_range,
+        "priority": "靠近工作地",
     }, None
 
 
 def build_recommend_prompt(preference: dict[str, Any]) -> str:
     return f"""# 宁安居租住片区推荐任务
 
-请基于来宁青年租房需求，推荐 4 个南京真实租住片区或生活圈。
+请基于来宁青年租房需求，推荐 3 个南京真实租住片区或生活圈，依次对应通勤优先、均衡、性价比优先方案。
 
 ## 用户偏好
-- 工作地址：{preference["workAddress"]}
-- 月租预算：{preference["budgetMin"]}-{preference["budgetMax"]} 元/月
-- 可接受通勤距离：{preference["commuteRange"]}
-- 最看重因素：{preference["priority"]}
+- 用户名：{preference["user_nickname"]}
+- 工作地址：{preference["work_address"]}
+- 月租预算：{preference["budget_min"]}-{preference["budget_max"]} 元/月
+- 可接受通勤距离：{preference["commute_distance_min"]}-{preference["commute_distance_max"]} km
+- 周边设施偏好：{"、".join(preference["facility_preferences"])}
+- 上下班交通方式：{preference["transport_preference"]}
+- 期望租住的房型：{preference["housing_type"]}
 
 ## 输出约束
 1. 不推荐具体房源、具体小区房号或中介信息。
 2. 不编造精确租金，只描述片区适配性。
 3. 必须返回严格 JSON，不要输出 Markdown 或解释文字。
 4. JSON 格式为：{{"areas":[{{"name":"片区名称","tagline":"一句话推荐标签","reason":"推荐理由","risk":"风险提示","tags":["标签1","标签2","标签3"]}}]}}
-5. areas 必须正好 4 条。
+5. areas 必须正好 3 条，顺序依次为通勤优先、均衡、性价比优先。
 """
 
 
@@ -341,7 +486,7 @@ def geocode_address(address: str) -> dict[str, Any] | None:
     params = parse.urlencode({"key": key, "address": address, "city": "南京"})
     url = f"https://restapi.amap.com/v3/geocode/geo?{params}"
     try:
-        with request.urlopen(url, timeout=12) as response:
+        with open_amap_url(url, timeout=12) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return fallback
@@ -587,7 +732,7 @@ def search_poi_location(keyword: str) -> dict[str, Any] | None:
     )
     url = f"https://restapi.amap.com/v3/place/text?{params}"
     try:
-        with request.urlopen(url, timeout=12) as response:
+        with open_amap_url(url, timeout=12) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
@@ -639,7 +784,7 @@ def geocode_address(address: str) -> dict[str, Any] | None:
     params = parse.urlencode({"key": key, "address": address, "city": "\u5357\u4eac"})
     url = f"https://restapi.amap.com/v3/geocode/geo?{params}"
     try:
-        with request.urlopen(url, timeout=12) as response:
+        with open_amap_url(url, timeout=12) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return search_poi_location(address) or fallback
@@ -735,7 +880,7 @@ def get_driving_route(origin: str, destination: str) -> dict[str, Any] | None:
     params = parse.urlencode({"key": key, "origin": origin, "destination": destination, "extensions": "all"})
     url = f"https://restapi.amap.com/v3/direction/driving?{params}"
     try:
-        with request.urlopen(url, timeout=16) as response:
+        with open_amap_url(url, timeout=16) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
@@ -796,7 +941,7 @@ def get_transit_route(origin: str, destination: str) -> dict[str, Any] | None:
     )
     url = f"https://restapi.amap.com/v3/direction/transit/integrated?{params}"
     try:
-        with request.urlopen(url, timeout=18) as response:
+        with open_amap_url(url, timeout=18) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
@@ -1047,7 +1192,12 @@ def calculate_commute_score(transit: dict[str, Any] | None, driving: dict[str, A
     }
 
 
-FACILITY_TYPES = "060000|050000|150000|090000|140000|080000|110000|070000"
+FACILITY_TYPES = "060000|050000|150000|090000|140000|080000|070000"
+FACILITY_PARK_TYPES = "110100"
+FACILITY_QUERY_VERSION = 2
+FACILITY_REQUEST_INTERVAL = 0.4
+_facility_request_lock = threading.Lock()
+_facility_next_request_at = 0.0
 FACILITY_DIMENSIONS: list[dict[str, str]] = [
     {"key": "shopping", "facilityName": "\u8d2d\u7269\u670d\u52a1", "typePrefix": "06"},
     {"key": "food", "facilityName": "\u9910\u996e\u670d\u52a1", "typePrefix": "05"},
@@ -1055,7 +1205,7 @@ FACILITY_DIMENSIONS: list[dict[str, str]] = [
     {"key": "medical", "facilityName": "\u533b\u7597\u8d44\u6e90", "typePrefix": "09"},
     {"key": "education", "facilityName": "\u79d1\u6559\u6587\u5316", "typePrefix": "14"},
     {"key": "sports", "facilityName": "\u4f53\u80b2\u4f11\u95f2", "typePrefix": "08"},
-    {"key": "park", "facilityName": "\u516c\u56ed\u7eff\u5730", "typePrefix": "11"},
+    {"key": "park", "facilityName": "\u516c\u56ed\u7eff\u5730", "typePrefix": "1101"},
     {"key": "life", "facilityName": "\u751f\u6d3b\u670d\u52a1", "typePrefix": "07"},
 ]
 
@@ -1128,6 +1278,23 @@ def simplify_poi(poi: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def request_facility_page(url: str) -> dict[str, Any]:
+    global _facility_next_request_at
+    # The server is threaded; serialize all facility queries, not only pages of one area.
+    with _facility_request_lock:
+        delay = _facility_next_request_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            with open_amap_url(url, timeout=14) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            _facility_next_request_at = time.monotonic() + FACILITY_REQUEST_INTERVAL
+    if not isinstance(payload, dict):
+        raise ValueError("高德返回内容无效")
+    return payload
+
+
 def fetch_around_pois(lng: float, lat: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     key = facility_amap_key()
     if not key:
@@ -1136,54 +1303,58 @@ def fetch_around_pois(lng: float, lat: float) -> tuple[list[dict[str, Any]], lis
     raw_pages: list[dict[str, Any]] = []
     simplified: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    message = ""
 
-    for page in range(1, 4):
-        params = parse.urlencode(
-            {
-                "key": key,
-                "location": f"{lng},{lat}",
-                "types": FACILITY_TYPES,
-                "city": "\u5357\u4eac",
-                "radius": "1000",
-                "offset": "20",
-                "page": str(page),
-                "extensions": "base",
-                "output": "JSON",
-            }
-        )
-        if page > 1:
-            time.sleep(0.35)
-        url = f"https://restapi.amap.com/v3/place/around?{params}"
-        try:
-            with request.urlopen(url, timeout=14) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except Exception as exc:
-            message = f"\u90e8\u5206 POI \u5206\u9875\u8bf7\u6c42\u5931\u8d25\uff1a{exc}"
-            continue
+    for types, max_pages in ((FACILITY_TYPES, 3), (FACILITY_PARK_TYPES, 2)):
+        for page in range(1, max_pages + 1):
+            params = parse.urlencode(
+                {
+                    "key": key,
+                    "location": f"{lng:.6f},{lat:.6f}",
+                    "types": types,
+                    "city": "\u5357\u4eac",
+                    "radius": "1000",
+                    "offset": "20",
+                    "page": str(page),
+                    "sortrule": "distance",
+                    "extensions": "base",
+                    "output": "JSON",
+                }
+            )
+            url = f"https://restapi.amap.com/v3/place/around?{params}"
+            for attempt in range(2):
+                try:
+                    payload = request_facility_page(url)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    if attempt == 0:
+                        time.sleep(0.7)
+                        continue
+                    return [], raw_pages, "高德周边设施请求失败，请稍后重试"
+                if str(payload.get("status")) == "1" and isinstance(payload.get("pois"), list):
+                    break
+                if str(payload.get("infocode")) == "10016" and attempt == 0:
+                    time.sleep(0.7)
+                    continue
+                return [], raw_pages, f"高德周边设施查询失败：{payload.get('info') or '未知错误'}"
 
-        raw_pages.append(payload)
-        pois = payload.get("pois")
-        if payload.get("status") != "1" or not isinstance(pois, list):
-            message = str(payload.get("info") or "\u90e8\u5206 POI \u5206\u9875\u65e0\u6548")
-            if "EXCEEDED" in message.upper() or "LIMIT" in message.upper():
+            raw_pages.append(payload)
+            pois = payload["pois"]
+            if not pois:
                 break
-            continue
-        if not pois:
-            break
-        for poi in pois:
-            if not isinstance(poi, dict):
-                continue
-            item = simplify_poi(poi)
-            if not item:
-                continue
-            dedupe_key = item["id"] or f"{item['name']}@{item['lng']},{item['lat']}"
-            if dedupe_key in seen_ids:
-                continue
-            seen_ids.add(dedupe_key)
-            simplified.append(item)
+            for poi in pois:
+                if not isinstance(poi, dict):
+                    continue
+                item = simplify_poi(poi)
+                if not item:
+                    continue
+                dedupe_key = item["id"] or f"{item['name']}@{item['lng']},{item['lat']}"
+                if dedupe_key in seen_ids:
+                    continue
+                seen_ids.add(dedupe_key)
+                simplified.append(item)
+            if len(pois) < 20:
+                break
 
-    return simplified, raw_pages, message
+    return simplified, raw_pages, ""
 
 
 def build_poi_summary(pois: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1219,15 +1390,23 @@ def get_cached_facility_result(
         with get_connection() as conn:
             latest = conn.execute(
                 """
-                select created_at
-                from facility_evaluation
-                where preference_id = ? and area_name = ?
-                group by created_at
-                having count(*) >= 8
-                order by created_at desc
+                select raw.created_at
+                from facility_poi_raw as raw
+                where raw.preference_id = ? and raw.area_name = ?
+                  and abs(raw.area_lng - ?) < 0.000001
+                  and abs(raw.area_lat - ?) < 0.000001
+                  and raw.raw_json like ?
+                  and (
+                    select count(*) from facility_evaluation as evaluation
+                    where evaluation.preference_id = raw.preference_id
+                      and evaluation.area_name = raw.area_name
+                      and evaluation.created_at = raw.created_at
+                  ) >= 8
+                order by raw.created_at desc
                 limit 1
                 """,
-                (preference_id, area_name),
+                (preference_id, area_name, area_location["lng"], area_location["lat"],
+                 f'{{"facility_query_version": {FACILITY_QUERY_VERSION},%'),
             ).fetchone()
             if not latest:
                 return None
@@ -1319,6 +1498,8 @@ def find_recommendation_area(preference_id: str, area_name: str) -> dict[str, An
                     "tagline": str(area.get("tagline") or "").strip(),
                     "reason": str(area.get("reason") or "").strip(),
                     "tags": [str(tag) for tag in tags[:3]] if isinstance(tags, list) else [],
+                    "rent_min": coze_number(area.get("rent_min")),
+                    "rent_max": coze_number(area.get("rent_max")),
                 }
     return None
 
@@ -1332,7 +1513,7 @@ def normalize_areas(value: Any) -> list[dict[str, Any]] | None:
     if not isinstance(value, dict):
         return None
     areas = value.get("areas")
-    if not isinstance(areas, list) or len(areas) != 4:
+    if not isinstance(areas, list) or len(areas) != 3:
         return None
 
     normalized: list[dict[str, Any]] = []
@@ -1358,6 +1539,159 @@ def normalize_areas(value: Any) -> list[dict[str, Any]] | None:
             }
         )
     return normalized
+
+
+def coze_boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value or "").strip().lower() in {"true", "1", "yes", "y"}
+
+
+def coze_number(value: Any) -> float | int | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def parse_area_location(value: Any, area_name: str) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        lng = float(value.get("lng"))
+        lat = float(value.get("lat"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(lng) or not math.isfinite(lat) or not (-180 <= lng <= 180) or not (-90 <= lat <= 90):
+        return None
+    return {"name": area_name, "lng": lng, "lat": lat}
+
+
+def normalize_workflow_community(value: Any, strategy: str, index: int) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    community_id = str(value.get("community_id") or value.get("id") or "").strip()
+    community_name = str(value.get("community_name") or value.get("name") or "").strip()
+    if not community_name:
+        return None
+
+    raw_tags = value.get("tags")
+    tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()] if isinstance(raw_tags, list) else []
+    tags = tags[:2]
+    facility_match = coze_boolean(value.get("facility_match"))
+    facility_status = str(value.get("facility_status") or "").strip()
+    facility_tag = str(value.get("facility_tag") or "").strip() if facility_match else ""
+    tagline = " · ".join(tags) or "符合当前租住需求"
+
+    return {
+        "id": community_id or f"{strategy}-{index + 1}",
+        "name": community_name,
+        "tagline": tagline,
+        "reason": "、".join(tags) if tags else "该微社区与当前租住需求具有较高匹配度。",
+        "risk": "",
+        "tags": tags,
+        "community_id": community_id,
+        "community_name": community_name,
+        "distance_km": coze_number(value.get("distance_km")),
+        "facility_checks": value.get("facility_checks"),
+        "facility_match": facility_match,
+        "facility_status": facility_status,
+        "facility_tag": facility_tag,
+        "gcj02_lat": coze_number(value.get("gcj02_lat")),
+        "gcj02_lng": coze_number(value.get("gcj02_lng")),
+        "poi_score": coze_number(value.get("poi_score")),
+        "rank": coze_number(value.get("rank")),
+        "rent_max": coze_number(value.get("rent_max")),
+        "rent_median": coze_number(value.get("rent_median")),
+        "rent_min": coze_number(value.get("rent_min")),
+        "strategy": str(value.get("strategy") or strategy).strip(),
+        "tag_source": str(value.get("tag_source") or "").strip(),
+        "source": "coze",
+    }
+
+
+def normalize_workflow_plans(value: Any, depth: int = 0) -> dict[str, list[dict[str, Any]]] | None:
+    if depth > 10:
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        try:
+            return normalize_workflow_plans(json.loads(text), depth + 1)
+        except (json.JSONDecodeError, TypeError):
+            # 返回文本模式可能把三组数组写成连续的 JSON 文档：
+            # [commute]\n[balanced]\n[cost_effective]
+            decoder = json.JSONDecoder()
+            documents: list[Any] = []
+            cursor = 0
+            while cursor < len(text):
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                if cursor >= len(text):
+                    break
+                try:
+                    document, cursor = decoder.raw_decode(text, cursor)
+                except json.JSONDecodeError:
+                    documents = []
+                    break
+                documents.append(document)
+
+            if documents and all(isinstance(document, list) for document in documents):
+                grouped: dict[str, list[Any]] = {
+                    "commute": [],
+                    "balanced": [],
+                    "cost_effective": [],
+                }
+                strategy_mapping = {
+                    "commute": "commute",
+                    "commute_priority": "commute",
+                    "balanced": "balanced",
+                    "cost_effective": "cost_effective",
+                }
+                for document in documents:
+                    for item in document:
+                        if not isinstance(item, dict):
+                            continue
+                        target = strategy_mapping.get(str(item.get("strategy") or "").strip())
+                        if target:
+                            grouped[target].append(item)
+                if all(grouped[key] for key in grouped):
+                    return normalize_workflow_plans(grouped, depth + 1)
+            return None
+
+    if not isinstance(value, dict):
+        return None
+
+    plan_keys = ("commute", "balanced", "cost_effective")
+    if all(isinstance(value.get(key), list) for key in plan_keys):
+        plans: dict[str, list[dict[str, Any]]] = {}
+        for strategy in plan_keys:
+            normalized = [
+                community
+                for index, item in enumerate(value[strategy][:3])
+                if (community := normalize_workflow_community(item, strategy, index)) is not None
+            ]
+            if not normalized:
+                return None
+            plans[strategy] = normalized
+        return plans
+
+    for key in ("data", "output", "result", "content", "answer", "message", "tag_results"):
+        if key in value:
+            nested = normalize_workflow_plans(value.get(key), depth + 1)
+            if nested:
+                return nested
+    return None
 
 
 def extract_json_from_coze(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -1453,27 +1787,62 @@ def should_retry_coze_error(status_code: int | None, payload: Any, error_text: s
     return False
 
 
-def build_coze_request_body(markdown_prompt: str) -> dict[str, Any]:
+def build_coze_request_body(preference: dict[str, Any]) -> dict[str, Any]:
     request_body: dict[str, Any] = {
         "workflow_id": os.getenv("COZE_RECOMMEND_WORKFLOW_ID", COZE_DEFAULT_WORKFLOW_ID).strip()
         or COZE_DEFAULT_WORKFLOW_ID,
         "parameters": {
-            "markdown_prompt": markdown_prompt,
+            "user_nickname": preference["user_nickname"],
+            "work_address": preference["work_address"],
+            "budget_max": preference["budget_max"],
+            "budget_min": preference["budget_min"],
+            "commute_distance_max": preference["commute_distance_max"],
+            "commute_distance_min": preference["commute_distance_min"],
+            "facility_preferences": preference["facility_preferences"],
+            "transport_preference": preference["transport_preference"],
+            "housing_type": preference["housing_type"],
         },
     }
-    app_id = os.getenv("COZE_APP_ID", "").strip()
+    app_id = os.getenv("COZE_APP_ID", COZE_DEFAULT_APP_ID).strip() or COZE_DEFAULT_APP_ID
     if app_id:
         request_body["app_id"] = app_id
     return request_body
 
 
-def run_coze_workflow(preference: dict[str, Any], markdown_prompt: str) -> tuple[list[dict[str, Any]] | None, str | None]:
+def decode_coze_output(value: Any, depth: int = 0) -> Any:
+    if depth > 6:
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return decode_coze_output(json.loads(text), depth + 1)
+        except (json.JSONDecodeError, TypeError):
+            return value
+    if isinstance(value, dict):
+        return {key: decode_coze_output(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, list):
+        return [decode_coze_output(item, depth + 1) for item in value]
+    return value
+
+
+def extract_coze_workflow_output(payload: Any) -> Any | None:
+    if not isinstance(payload, dict) or not coze_payload_has_success(payload):
+        return None
+    for key in ("data", "output", "result"):
+        if key in payload and payload[key] is not None:
+            return decode_coze_output(payload[key])
+    return None
+
+
+def run_coze_workflow(
+    preference: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]] | None, Any | None, str | None]:
     token = os.getenv("COZE_API_TOKEN", "").strip()
     if not token:
-        return None, json.dumps({"error": "missing_token", "message": "COZE_API_TOKEN is not configured"}, ensure_ascii=False)
+        return None, None, json.dumps({"error": "missing_token", "message": "COZE_API_TOKEN is not configured"}, ensure_ascii=False)
 
     base_url = os.getenv("COZE_BASE_URL", COZE_DEFAULT_BASE_URL).strip().rstrip("/") or COZE_DEFAULT_BASE_URL
-    request_body = build_coze_request_body(markdown_prompt)
+    request_body = build_coze_request_body(preference)
     endpoint = f"{base_url}/v1/workflow/run"
     attempts = int(os.getenv("COZE_RECOMMEND_MAX_RETRIES", "3") or "3")
     attempts = max(1, min(attempts, 5))
@@ -1518,10 +1887,10 @@ def run_coze_workflow(preference: dict[str, Any], markdown_prompt: str) -> tuple
             "errorText": error_text,
         }
 
-        coze_json = extract_json_from_coze(parsed)
-        areas = normalize_areas(coze_json) if coze_json else None
-        if areas:
-            return areas, json.dumps(last_payload, ensure_ascii=False)
+        workflow_output = extract_coze_workflow_output(parsed)
+        plans = normalize_workflow_plans(workflow_output)
+        if workflow_output is not None:
+            return plans, workflow_output, json.dumps(last_payload, ensure_ascii=False)
 
         if attempt < attempts and should_retry_coze_error(status_code, parsed, error_text):
             time.sleep(min(8, 1.6 * attempt))
@@ -1533,7 +1902,7 @@ def run_coze_workflow(preference: dict[str, Any], markdown_prompt: str) -> tuple
 
         break
 
-    return None, json.dumps(last_payload or {"error": "unknown_coze_error"}, ensure_ascii=False)
+    return None, None, json.dumps(last_payload or {"error": "unknown_coze_error"}, ensure_ascii=False)
 
 
 def get_coze_fallback_message(raw_response: str | None) -> str:
@@ -1594,6 +1963,15 @@ class NinganjuHandler(BaseHTTPRequestHandler):
         if self.path == "/api/login":
             self.handle_login()
             return
+        if self.path == "/api/change-password":
+            self.handle_change_password()
+            return
+        if self.path == "/api/profile":
+            self.handle_profile()
+            return
+        if self.path == "/api/profile/detail-view":
+            self.handle_profile_detail_view()
+            return
         if self.path == "/api/recommend-areas":
             self.handle_recommend_areas()
             return
@@ -1602,6 +1980,9 @@ class NinganjuHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/facilities":
             self.handle_facilities()
+            return
+        if self.path == "/api/metrics/amap-client-call":
+            self.handle_amap_client_call()
             return
         if self.path == "/api/evaluation-history/save":
             self.handle_save_evaluation_history()
@@ -1667,10 +2048,21 @@ class NinganjuHandler(BaseHTTPRequestHandler):
             with get_connection() as conn:
                 row = conn.execute("select * from users where username = ?", (username,)).fetchone()
 
-            if row is None or hash_password(password, row["salt"]) != row["password_hash"]:
+            if row is None or not verify_password(password, row["salt"], row["password_hash"]):
                 json_response(self, 401, {"ok": False, "message": "用户名或密码错误"})
                 return
 
+            session_token = create_profile_session(row["username"])
+            login_time = utc_now()
+            with get_connection() as conn:
+                conn.execute(
+                    "insert into user_activity (username, event_type, created_at) values (?, 'login', ?)",
+                    (row["username"], login_time),
+                )
+                conn.execute(
+                    "insert into user_login (username, login_time) values (?, ?)",
+                    (row["username"], login_time),
+                )
             json_response(
                 self,
                 200,
@@ -1682,10 +2074,162 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                         "username": row["username"],
                         "role": row["role"],
                     },
+                    "sessionToken": session_token,
                 },
             )
         except Exception:
             json_response(self, 500, {"ok": False, "message": "登录失败，请稍后重试"})
+
+    def handle_change_password(self) -> None:
+        try:
+            data = parse_body(self)
+            username = str(data.get("username", "")).strip()
+            current_password = str(data.get("currentPassword", ""))
+            new_password = str(data.get("newPassword", ""))
+            confirm_password = str(data.get("confirmPassword", ""))
+
+            if not username or not current_password or not new_password or not confirm_password:
+                json_response(self, 400, {"ok": False, "message": "请填写用户名、当前密码和两次新密码"})
+                return
+            if new_password != confirm_password:
+                json_response(self, 400, {"ok": False, "message": "两次输入的新密码不一致"})
+                return
+            if len(new_password) < 8:
+                json_response(self, 400, {"ok": False, "message": "新密码至少需要8位"})
+                return
+            if new_password == current_password:
+                json_response(self, 400, {"ok": False, "message": "新密码不能与当前密码相同"})
+                return
+
+            with get_connection() as conn:
+                row = conn.execute(
+                    "select password_hash, salt from users where username = ?", (username,)
+                ).fetchone()
+                if row is None or not verify_password(current_password, row["salt"], row["password_hash"]):
+                    json_response(self, 401, {"ok": False, "message": "用户名或当前密码错误"})
+                    return
+                salt = secrets.token_hex(16)
+                conn.execute(
+                    "update users set password_hash = ?, salt = ? where username = ?",
+                    (hash_password(new_password, salt), salt, username),
+                )
+
+            with _profile_session_lock:
+                for token, (session_username, _) in list(_profile_sessions.items()):
+                    if session_username == username:
+                        _profile_sessions.pop(token, None)
+            json_response(self, 200, {"ok": True, "message": "密码修改成功，请使用新密码登录"})
+        except Exception:
+            json_response(self, 500, {"ok": False, "message": "密码修改失败，请稍后重试"})
+
+    def handle_amap_client_call(self) -> None:
+        origin = self.headers.get("Origin", "")
+        if origin and origin not in {"http://127.0.0.1:5173", "http://localhost:5173"}:
+            json_response(self, 403, {"success": False, "message": "来源不被允许"})
+            return
+        try:
+            increment_metric("amap_api_call")
+            json_response(self, 200, {"success": True})
+        except Exception:
+            json_response(self, 500, {"success": False, "message": "地图调用次数记录失败"})
+
+    def handle_profile(self) -> None:
+        username = profile_session_username(self.headers.get("Authorization", ""))
+        if not username:
+            json_response(self, 401, {"success": False, "message": "登录状态已失效，请重新登录"})
+            return
+        try:
+            with get_connection() as conn:
+                latest = conn.execute(
+                    """
+                    select work_address, budget_min, budget_max, commute_distance_min,
+                           commute_distance_max, transport_preference, housing_type,
+                           facility_preferences, created_at
+                    from rent_preference
+                    where user_nickname = ?
+                    order by created_at desc, rowid desc
+                    limit 1
+                    """,
+                    (username,),
+                ).fetchone()
+                recommendation_count = conn.execute(
+                    "select count(*) from rent_preference where user_nickname = ?", (username,)
+                ).fetchone()[0]
+                detail_view_count = conn.execute(
+                    "select count(*) from user_activity where username = ? and event_type = 'detail_view'",
+                    (username,),
+                ).fetchone()[0]
+                saved_count = conn.execute(
+                    "select count(*) from evaluation_history where username = ?", (username,)
+                ).fetchone()[0]
+                last_activity = conn.execute(
+                    "select created_at from user_activity where username = ? order by created_at desc, id desc limit 1",
+                    (username,),
+                ).fetchone()
+
+            facility_preferences = []
+            if latest:
+                try:
+                    stored_facilities = json.loads(latest["facility_preferences"] or "[]")
+                    if isinstance(stored_facilities, list):
+                        facility_preferences = [
+                            str(item).strip() for item in stored_facilities if str(item).strip()
+                        ]
+                except (TypeError, ValueError):
+                    pass
+
+            json_response(
+                self,
+                200,
+                {
+                    "success": True,
+                    "username": username,
+                    "latestPreference": {
+                        "workAddress": latest["work_address"],
+                        "budgetMin": latest["budget_min"],
+                        "budgetMax": latest["budget_max"],
+                        "commuteDistanceMin": latest["commute_distance_min"],
+                        "commuteDistanceMax": latest["commute_distance_max"],
+                        "transportPreference": latest["transport_preference"],
+                        "housingType": latest["housing_type"],
+                        "facilityPreferences": facility_preferences,
+                        "createdAt": latest["created_at"],
+                    } if latest else None,
+                    "stats": {
+                        "recommendationCount": recommendation_count,
+                        "detailViewCount": detail_view_count,
+                        "savedCommunityCount": saved_count,
+                        "lastUsedAt": last_activity["created_at"] if last_activity else None,
+                    },
+                },
+            )
+        except Exception as exc:
+            json_response(self, 500, {"success": False, "message": "个人信息读取失败，请稍后重试", "detail": str(exc)})
+
+    def handle_profile_detail_view(self) -> None:
+        username = profile_session_username(self.headers.get("Authorization", ""))
+        if not username:
+            json_response(self, 401, {"success": False, "message": "登录状态已失效，请重新登录"})
+            return
+        try:
+            data = parse_body(self)
+            preference_id = str(data.get("preferenceId", "")).strip()
+            area_name = str(data.get("areaName", "")).strip()
+            if not preference_id or not area_name:
+                json_response(self, 400, {"success": False, "message": "缺少微社区详情信息"})
+                return
+            with get_connection() as conn:
+                preference = conn.execute(
+                    "select id from rent_preference where id = ? and user_nickname = ?",
+                    (preference_id, username),
+                ).fetchone()
+            if not preference:
+                json_response(self, 404, {"success": False, "message": "未找到当前用户的租房需求记录"})
+                return
+            record_user_activity(username, "detail_view", preference_id, area_name)
+            json_response(self, 200, {"success": True})
+        except Exception as exc:
+            json_response(self, 500, {"success": False, "message": "详情查看次数记录失败", "detail": str(exc)})
 
     def handle_recommend_areas(self) -> None:
         try:
@@ -1697,33 +2241,59 @@ class NinganjuHandler(BaseHTTPRequestHandler):
 
             preference_id = str(uuid.uuid4())
             markdown_prompt = build_recommend_prompt(preference)
+            preference_json = {
+                "user_nickname": preference["user_nickname"],
+                "work_address": preference["work_address"],
+                "budget_max": preference["budget_max"],
+                "budget_min": preference["budget_min"],
+                "commute_distance_max": preference["commute_distance_max"],
+                "commute_distance_min": preference["commute_distance_min"],
+                "facility_preferences": preference["facility_preferences"],
+                "transport_preference": preference["transport_preference"],
+                "housing_type": preference["housing_type"],
+            }
             increment_metric("area_evaluation")
 
             with get_connection() as conn:
                 conn.execute(
                     """
                     insert into rent_preference
-                    (id, work_address, budget_min, budget_max, commute_range, priority, markdown_prompt, created_at)
-                    values (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, user_nickname, work_address, budget_min, budget_max,
+                     commute_distance_min, commute_distance_max, facility_preferences,
+                     transport_preference, housing_type, preference_json,
+                     commute_range, priority, markdown_prompt, created_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         preference_id,
-                        preference["workAddress"],
-                        preference["budgetMin"],
-                        preference["budgetMax"],
-                        preference["commuteRange"],
+                        preference["user_nickname"],
+                        preference["work_address"],
+                        preference["budget_min"],
+                        preference["budget_max"],
+                        preference["commute_distance_min"],
+                        preference["commute_distance_max"],
+                        json.dumps(preference["facility_preferences"], ensure_ascii=False),
+                        preference["transport_preference"],
+                        preference["housing_type"],
+                        json.dumps(preference_json, ensure_ascii=False),
+                        preference["commute_range"],
                         preference["priority"],
                         markdown_prompt,
                         utc_now(),
                     ),
                 )
 
-            coze_areas, raw_response = run_coze_workflow(preference, markdown_prompt)
-            areas = coze_areas or [
+            record_user_activity(preference["user_nickname"], "recommendation", preference_id)
+            coze_plans, workflow_output, raw_response = run_coze_workflow(preference)
+            areas = (
+                [area for key in ("commute", "balanced", "cost_effective") for area in coze_plans[key]]
+                if coze_plans
+                else [
                 {**area, "id": f"{index + 1:02d}"}
-                for index, area in enumerate(FALLBACK_AREAS)
-            ]
-            source = "coze" if coze_areas else "fallback"
+                for index, area in enumerate(FALLBACK_AREAS[:3])
+                ]
+            )
+            source = "coze" if coze_plans else "fallback"
 
             with get_connection() as conn:
                 conn.execute(
@@ -1748,25 +2318,29 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                 {
                     "success": True,
                     "preferenceId": preference_id,
+                    "preferenceJson": preference_json,
                     "areas": areas,
+                    "plans": coze_plans,
                     "source": source,
-                    "message": None if coze_areas else get_coze_fallback_message(raw_response),
+                    "workflowSucceeded": coze_plans is not None,
+                    "workflowOutput": workflow_output,
+                    "message": (
+                        "推荐完成，三类方案已根据本次租住需求更新。"
+                        if coze_plans is not None
+                        else "工作流已响应，但返回结构未包含三类推荐方案。"
+                        if workflow_output is not None
+                        else get_coze_fallback_message(raw_response)
+                    ),
                 },
             )
-        except Exception:
-            fallback_id = f"demo-{uuid.uuid4()}"
+        except Exception as exc:
             json_response(
                 self,
-                200,
+                500,
                 {
-                    "success": True,
-                    "preferenceId": fallback_id,
-                    "areas": [
-                        {**area, "id": f"{index + 1:02d}"}
-                        for index, area in enumerate(FALLBACK_AREAS)
-                    ],
-                    "source": "fallback",
-                    "message": "真实接口暂不可用，已返回演示推荐结果",
+                    "success": False,
+                    "message": "租房需求保存失败，请稍后重试",
+                    "detail": str(exc),
                 },
             )
 
@@ -1800,15 +2374,45 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                     """,
                     (top_area_since,),
                 ).fetchall()
+                detail_view_count = conn.execute(
+                    """
+                    select count(*) from user_activity
+                    where event_type = 'detail_view' and date(created_at, '+8 hours') = ?
+                    """,
+                    (today,),
+                ).fetchone()[0]
+                recent_login_rows = conn.execute(
+                    """
+                    select user_login.id, user_login.username, user_login.login_time,
+                           (select count(*) from rent_preference
+                            where rent_preference.user_nickname = user_login.username) as recommendation_count
+                    from user_login
+                    order by user_login.login_time desc, user_login.id desc
+                    limit 5
+                    """
+                ).fetchall()
 
             metrics_by_day: dict[tuple[str, str], int] = {
                 (row["metric_name"], row["metric_date"]): int(row["count"]) for row in metric_rows
             }
+            workflow_calls = metrics_by_day.get(("area_evaluation", today), 0)
             today_metrics = {
                 "siteVisits": metrics_by_day.get(("site_visit", today), 0),
                 "newRegistrations": metrics_by_day.get(("new_registration", today), 0),
-                "areaEvaluations": metrics_by_day.get(("area_evaluation", today), 0),
+                "areaEvaluations": workflow_calls * 9,
+                "detailViews": int(detail_view_count),
+                "workflowCalls": workflow_calls,
+                "amapApiCalls": metrics_by_day.get(("amap_api_call", today), 0),
             }
+            recent_logins = [
+                {
+                    "id": row["id"],
+                    "username": row["username"],
+                    "recommendationCount": int(row["recommendation_count"]),
+                    "loginTime": row["login_time"],
+                }
+                for row in recent_login_rows
+            ]
             visit_trend = [
                 {
                     "date": date_key,
@@ -1846,6 +2450,7 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                 {
                     "success": True,
                     "todayMetrics": today_metrics,
+                    "recentLogins": recent_logins,
                     "visitTrend": visit_trend,
                     "topAreas": top_areas,
                     "updatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1877,6 +2482,7 @@ class NinganjuHandler(BaseHTTPRequestHandler):
             data = parse_body(self)
             preference_id = str(data.get("preferenceId", "")).strip()
             area_name = str(data.get("areaName", "")).strip()
+            area_location_data = data.get("areaLocation")
             commute_mode = str(data.get("mode", "driving")).strip()
             if commute_mode not in {"driving", "transit"}:
                 commute_mode = "driving"
@@ -1886,11 +2492,15 @@ class NinganjuHandler(BaseHTTPRequestHandler):
             if not area_name:
                 json_response(self, 400, {"success": False, "message": "缺少 areaName"})
                 return
+            if area_location_data is not None and parse_area_location(area_location_data, area_name) is None:
+                json_response(self, 400, {"success": False, "message": "微社区经纬度无效"})
+                return
 
             with get_connection() as conn:
                 row = conn.execute(
                     """
-                    select id, work_address, work_lng, work_lat
+                    select id, work_address, work_lng, work_lat,
+                           budget_min, budget_max, housing_type
                     from rent_preference
                     where id = ?
                     """,
@@ -1917,7 +2527,11 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                             (work_location["lng"], work_location["lat"], preference_id),
                         )
 
-            area_location = geocode_area_location(area_name)
+            area_location = (
+                parse_area_location(area_location_data, area_name)
+                if area_location_data is not None
+                else geocode_area_location(area_name)
+            )
 
             if not work_location and not area_location:
                 json_response(
@@ -1933,6 +2547,13 @@ class NinganjuHandler(BaseHTTPRequestHandler):
             commute = None
             commute_score_result = None
             recommendation_area = find_recommendation_area(preference_id, area_name)
+            rent_context = {
+                "budgetMin": int(row["budget_min"]),
+                "budgetMax": int(row["budget_max"]),
+                "housingType": str(row["housing_type"]),
+                "rentMin": recommendation_area.get("rent_min") if recommendation_area else None,
+                "rentMax": recommendation_area.get("rent_max") if recommendation_area else None,
+            }
             route_message = ""
             if work_location and area_location:
                 origin = f"{area_location['lng']},{area_location['lat']}"
@@ -1974,6 +2595,7 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                     "commute": commute,
                     "commuteScoreResult": commute_score_result,
                     "recommendationArea": recommendation_area,
+                    "rentContext": rent_context,
                     "message": route_message,
                 },
             )
@@ -1999,18 +2621,12 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                 json_response(self, 400, {"success": False, "message": "缺少 areaName"})
                 return
 
-            area_location = None
-            if isinstance(area_location_data, dict):
-                try:
-                    area_location = {
-                        "name": area_name,
-                        "lng": float(area_location_data.get("lng")),
-                        "lat": float(area_location_data.get("lat")),
-                    }
-                except (TypeError, ValueError):
-                    area_location = None
-
-            if area_location is None:
+            if area_location_data is not None:
+                area_location = parse_area_location(area_location_data, area_name)
+                if area_location is None:
+                    json_response(self, 400, {"success": False, "message": "微社区经纬度无效"})
+                    return
+            else:
                 area_location = geocode_area_location(area_name)
 
             if not area_location:
@@ -2024,6 +2640,9 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                 return
 
             pois, raw_pages, poi_message = fetch_around_pois(float(area_location["lng"]), float(area_location["lat"]))
+            if poi_message:
+                json_response(self, 502, {"success": False, "message": poi_message})
+                return
             poi_summary = build_poi_summary(pois)
             recommendation_reason = find_recommendation_reason(preference_id, area_name)
             created_at = utc_now()
@@ -2042,7 +2661,7 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                         area_name,
                         float(area_location["lng"]),
                         float(area_location["lat"]),
-                        json.dumps(raw_pages, ensure_ascii=False),
+                        json.dumps({"facility_query_version": FACILITY_QUERY_VERSION, "pages": raw_pages}, ensure_ascii=False),
                         created_at,
                     ),
                 )
@@ -2145,6 +2764,7 @@ class NinganjuHandler(BaseHTTPRequestHandler):
                 for row in old_rows:
                     conn.execute("delete from evaluation_history where id = ? and username = ?", (row["id"], username))
 
+            record_user_activity(username, "save_evaluation", str(other_info.get("preferenceId") or "") if isinstance(other_info, dict) else None, region_name)
             json_response(
                 self,
                 200,

@@ -5,6 +5,7 @@ export type EvaluationHistoryOtherInfo = {
   areaName?: string;
   recommendationArea?: RecommendationAreaBrief | null;
   areaLocation?: CommuteLocation | null;
+  rentScore?: number;
 };
 
 export type EvaluationHistoryRecord = {

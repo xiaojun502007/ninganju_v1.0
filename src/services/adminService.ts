@@ -4,6 +4,16 @@ export type AdminMetricSummary = {
   siteVisits: number;
   newRegistrations: number;
   areaEvaluations: number;
+  detailViews: number;
+  workflowCalls: number;
+  amapApiCalls: number;
+};
+
+export type RecentLoginItem = {
+  id: number;
+  username: string;
+  recommendationCount: number;
+  loginTime: string;
 };
 
 export type VisitTrendItem = {
@@ -21,6 +31,7 @@ export type TopAreaItem = {
 export type AdminDashboardData = {
   success: boolean;
   todayMetrics: AdminMetricSummary;
+  recentLogins: RecentLoginItem[];
   visitTrend: VisitTrendItem[];
   topAreas: TopAreaItem[];
   updatedAt: string;
